@@ -21,8 +21,6 @@ ESG 報告中的 AI 敘事分類
 -S	可推測性：描述 AI 未來可能的發展、效益或預期。
 
 
-可在 bert_sentence_classifier.py 的 LABELS 清單中自訂標籤。Excel 的 label 欄內容必須與清單設定一致。
-模型分類成果
 
 
 以下為 1,800 個句子測試集的分類結果。
