@@ -27,7 +27,7 @@ S	     83.3%	  83.8%	   83.6%
 平均	 84.1%	  83.7%	   83.8%
 
 Accuracy：83.4%
-使用技術
+-使用技術
 - Python
 - PyTorch
 - Hugging Face Transformers、Datasets
