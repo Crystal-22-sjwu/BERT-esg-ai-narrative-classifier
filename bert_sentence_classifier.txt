@@ -1,0 +1,387 @@
+import os
+os.environ["DISABLE_TQDM"] = "1"
+
+import random
+import numpy as np
+import pandas as pd
+import torch
+
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    classification_report,
+    confusion_matrix
+)
+
+from datasets import Dataset
+from transformers import (
+    BertTokenizer,
+    BertForSequenceClassification,
+    TrainingArguments,
+    Trainer,
+    EarlyStoppingCallback,
+    set_seed
+)
+from transformers.utils import logging
+
+logging.disable_progress_bar()
+
+# =========================================================
+# 0. 基本設定
+# =========================================================
+SEED = 42
+# 固定隨機種子，讓資料切分與訓練結果盡量可重現；更換數字會得到不同的隨機切分。
+set_seed(SEED)
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(SEED)
+
+# 人工標註資料放在這個 Excel 檔案中：每列一個句子，並在 label 欄填上人工判定的類別。
+# 實際執行時要換成自己的 Excel 檔案路徑。
+FILE_PATH = r"your_excel_file.xlsx"
+
+# 這兩個名稱必須和 Excel 的欄位名稱完全相同：sentence 放句子，label 放人工標註結果。
+TEXT_COL = "sentence"
+LABEL_COL = "label"
+
+# 標籤設定：需與 Excel 的 label 欄內容一致，也可以依自己的分類規則修改。
+# 目前分類：E = 可執行性（具體說明 AI 行動或應用如何落實）；
+#           N = 中性／其他（不屬於 E 或 S，或句子未明確表達兩類）；
+#           S = 可推測性（描述 AI 未來可能發展、效益或預期）。
+# 若更改標籤，要同步修改下方各類別的說明。
+LABELS = ["E", "N", "S"]
+
+MODEL_NAME = "bert-base-chinese"
+# 替換成模型要儲存的資料夾路徑
+OUTPUT_DIR = r"your_model_output_folder"
+
+# 最佳化參數（以下數值是本次實驗設定，不是所有資料都適用的唯一最佳值）
+MAX_LEN = 64          # 每句最多保留 64 個 Token；限制輸入長度以控制計算量，超過部分會截斷。
+BATCH_SIZE = 4        # 每次用 4 句更新模型；設定較小可降低 GPU 記憶體需求。
+EPOCHS = 5            # 最多完整讀取訓練資料 5 次；設定上限並搭配 Early Stopping，避免訓練過久。
+LEARNING_RATE = 2e-5  # 微調步伐採較小幅度，避免一次更新太大而破壞預訓練模型已學到的資訊。
+WEIGHT_DECAY = 0.01   # 輕度限制模型權重，降低模型過度記住訓練資料、造成過度擬合的風險。
+# ========================================================
+
+
+# =========================================================
+# 1. 讀取資料
+# =========================================================
+df = pd.read_excel(FILE_PATH)
+
+# 只保留必要欄位
+df = df[[TEXT_COL, LABEL_COL]].copy()
+
+# 去除空值
+df = df.dropna(subset=[TEXT_COL, LABEL_COL])
+
+# 文字與標籤清理
+df[TEXT_COL] = df[TEXT_COL].astype(str).str.strip()
+df[LABEL_COL] = df[LABEL_COL].astype(str).str.strip().str.upper()
+
+# 去除空字串
+df = df[df[TEXT_COL] != ""]
+df = df[df[LABEL_COL] != ""]
+
+# 只保留設定中列出的標籤；自訂 LABELS 後，這裡會依設定保留資料。
+df = df[df[LABEL_COL].isin(LABELS)].copy()
+
+print("清理後資料筆數：", len(df))
+print("\n標籤分布：")
+print(df[LABEL_COL].value_counts())
+
+
+# 2. 檢查同句不同標籤
+
+conflict_df = (
+    df.groupby(TEXT_COL)[LABEL_COL]
+    .nunique()
+    .reset_index(name="unique_label_count")
+)
+
+conflict_sentences = conflict_df[conflict_df["unique_label_count"] > 1][TEXT_COL]
+
+if len(conflict_sentences) > 0:
+    print("\n⚠ 發現同一句有不同標籤，請先人工處理：")
+    problem_rows = df[df[TEXT_COL].isin(conflict_sentences)].sort_values(by=[TEXT_COL, LABEL_COL])
+    print(problem_rows.head(20))
+    problem_rows.to_excel("conflicting_labels.xlsx", index=False)
+    print("\n已輸出 conflicting_labels.xlsx")
+    raise ValueError("請先處理同句不同標籤後再訓練。")
+else:
+    print("\n未發現同句不同標籤。")
+
+
+# 3. 去重複
+
+df = df.drop_duplicates(subset=[TEXT_COL, LABEL_COL]).reset_index(drop=True)
+
+print("\n去重複後資料筆數：", len(df))
+print("\n去重複後標籤分布：")
+print(df[LABEL_COL].value_counts())
+
+
+# 4. 標籤轉數字
+
+label2id = {label: index for index, label in enumerate(LABELS)}
+id2label = {index: label for label, index in label2id.items()}
+
+df["label_id"] = df[LABEL_COL].map(label2id)
+
+
+# 5. 切分 train / validation / test
+# 注意：這版還是會重新切 test set
+# 所以結果可以看趨勢，但不要和前面做嚴格比較
+
+train_df, temp_df = train_test_split(
+    df,
+    test_size=0.30,
+    random_state=SEED,
+    stratify=df["label_id"]
+)
+
+val_df, test_df = train_test_split(
+    temp_df,
+    test_size=0.50,
+    random_state=SEED,
+    stratify=temp_df["label_id"]
+)
+
+print("\nTrain:", len(train_df))
+print("Validation:", len(val_df))
+print("Test:", len(test_df))
+
+print("\nTrain label distribution:")
+print(train_df[LABEL_COL].value_counts())
+
+print("\nValidation label distribution:")
+print(val_df[LABEL_COL].value_counts())
+
+print("\nTest label distribution:")
+print(test_df[LABEL_COL].value_counts())
+
+
+# 6. 轉成 Hugging Face Dataset
+
+train_dataset = Dataset.from_pandas(
+    train_df[[TEXT_COL, "label_id"]].rename(columns={"label_id": "labels"}),
+    preserve_index=False
+)
+val_dataset = Dataset.from_pandas(
+    val_df[[TEXT_COL, "label_id"]].rename(columns={"label_id": "labels"}),
+    preserve_index=False
+)
+test_dataset = Dataset.from_pandas(
+    test_df[[TEXT_COL, "label_id"]].rename(columns={"label_id": "labels"}),
+    preserve_index=False
+)
+
+
+# 7. Tokenizer
+
+tokenizer = BertTokenizer.from_pretrained(MODEL_NAME)
+
+def tokenize_function(examples):
+    return tokenizer(
+        examples[TEXT_COL],
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_LEN
+    )
+
+train_dataset = train_dataset.map(tokenize_function, batched=True)
+val_dataset = val_dataset.map(tokenize_function, batched=True)
+test_dataset = test_dataset.map(tokenize_function, batched=True)
+
+columns_to_keep = ["input_ids", "attention_mask", "labels"]
+train_dataset.set_format(type="torch", columns=columns_to_keep)
+val_dataset.set_format(type="torch", columns=columns_to_keep)
+test_dataset.set_format(type="torch", columns=columns_to_keep)
+
+
+# 8. 載入 bert-base-chinese 分類模型
+# 每次都是重新從 bert-base-chinese 開始微調
+
+model = BertForSequenceClassification.from_pretrained(
+    MODEL_NAME,
+    num_labels=len(LABELS),
+    id2label=id2label,
+    label2id=label2id
+)
+
+
+# 9. 評估指標
+
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    preds = np.argmax(logits, axis=1)
+
+    acc = accuracy_score(labels, preds)
+    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+        labels,
+        preds,
+        average="macro",
+        zero_division=0
+    )
+    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        labels,
+        preds,
+        average="weighted",
+        zero_division=0
+    )
+
+    return {
+        "accuracy": acc,
+        "macro_precision": precision_macro,
+        "macro_recall": recall_macro,
+        "macro_f1": f1_macro,
+        "weighted_f1": f1_weighted
+    }
+
+
+# 10. TrainingArguments
+
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+
+    # 你在意的核心參數
+    learning_rate=LEARNING_RATE,
+    per_device_train_batch_size=BATCH_SIZE,
+    per_device_eval_batch_size=BATCH_SIZE,
+    num_train_epochs=EPOCHS,
+    weight_decay=WEIGHT_DECAY,
+
+    # 新版 transformers 寫法
+    eval_strategy="epoch",
+    save_strategy="epoch",
+    logging_strategy="epoch",
+
+    # 以驗證集 macro_f1 挑選表現最佳的模型，並保留最佳模型。
+    load_best_model_at_end=True,
+    metric_for_best_model="macro_f1",
+    greater_is_better=True,
+    save_total_limit=2,
+
+    report_to="none",
+    dataloader_pin_memory=False,
+    disable_tqdm=True
+)
+
+
+# 11. Trainer
+
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    processing_class=tokenizer,
+    compute_metrics=compute_metrics,
+    # 驗證集 macro_f1 連續 2 次評估沒有進步時提早停止，避免無效訓練與過度擬合。
+    callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
+)
+
+
+# 12. 開始微調
+
+print("\n===== Start Fine-tuning bert-base-chinese (1500 samples) =====")
+trainer.train()
+print("\n===== Training Finished =====")
+
+# =========================================================
+# 13. 驗證集評估
+# =========================================================
+val_result = trainer.evaluate(eval_dataset=val_dataset)
+print("\nValidation result:")
+print(val_result)
+
+# =========================================================
+# 14. 測試集評估
+# =========================================================
+pred_output = trainer.predict(test_dataset)
+pred_logits = pred_output.predictions
+pred_labels = np.argmax(pred_logits, axis=1)
+true_labels = pred_output.label_ids
+
+print("\nTest Classification Report:")
+print(classification_report(
+    true_labels,
+    pred_labels,
+    labels=list(range(len(LABELS))),
+    target_names=LABELS,
+    digits=4,
+    zero_division=0
+))
+
+# =========================================================
+# 15. Confusion Matrix
+# =========================================================
+cm = confusion_matrix(true_labels, pred_labels, labels=list(range(len(LABELS))))
+
+cm_df = pd.DataFrame(
+    cm,
+    index=[f"true_{id2label[i]}" for i in range(len(LABELS))],
+    columns=[f"pred_{id2label[i]}" for i in range(len(LABELS))]
+)
+
+print("\nConfusion Matrix:")
+print(cm_df)
+
+cm_df.to_excel("confusion_matrix.xlsx", index=True)
+print("\n已輸出：confusion_matrix.xlsx")
+
+# =========================================================
+# 16. 錯誤分析：抓出預測錯誤的句子
+# =========================================================
+test_sentences = test_df[TEXT_COL].reset_index(drop=True)
+true_label_names = [id2label[int(x)] for x in true_labels]
+pred_label_names = [id2label[int(x)] for x in pred_labels]
+
+error_df = pd.DataFrame({
+    "sentence": test_sentences,
+    "true_label": true_label_names,
+    "pred_label": pred_label_names
+})
+
+misclassified_df = error_df[error_df["true_label"] != error_df["pred_label"]].copy()
+
+print("\n判錯筆數：", len(misclassified_df))
+print("\n前10筆判錯句子：")
+print(misclassified_df.head(10))
+
+misclassified_df.to_excel("misclassified_sentences.xlsx", index=False)
+print("\n已輸出：misclassified_sentences.xlsx")
+
+# =========================================================
+# 17. soft max 輸出機率分布
+# =========================================================
+probs = torch.nn.functional.softmax(torch.tensor(pred_logits), dim=1).numpy()
+
+for label, label_id in label2id.items():
+    error_df[f"prob_{label}"] = probs[:, label_id]
+error_df["max_prob"] = probs.max(axis=1)
+
+misclassified_with_prob = error_df[error_df["true_label"] != error_df["pred_label"]].copy()
+misclassified_with_prob = misclassified_with_prob.sort_values(by="max_prob", ascending=True)
+
+print("\n最不確定且判錯的前10句：")
+print(misclassified_with_prob.head(10))
+
+misclassified_with_prob.to_excel("misclassified_with_probability.xlsx", index=False)
+print("\n已輸出：misclassified_with_probability.xlsx")
+
+all_test_with_prob = error_df.copy()
+all_test_with_prob = all_test_with_prob.sort_values(by="max_prob", ascending=True)
+all_test_with_prob.to_excel("all_test_sentences_with_probability.xlsx", index=False)
+print("\n已輸出：all_test_sentences_with_probability.xlsx")
+
+# =========================================================
+# 18. 儲存模型與 tokenizer
+# =========================================================
+trainer.save_model(OUTPUT_DIR)
+tokenizer.save_pretrained(OUTPUT_DIR)
+
+print(f"\n模型已儲存到：{OUTPUT_DIR}")
